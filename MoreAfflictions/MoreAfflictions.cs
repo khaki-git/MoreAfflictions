@@ -1,213 +1,177 @@
-﻿using BepInEx;
-using BepInEx.Configuration;
-using HarmonyLib;
-using MoreAfflictionsPlugin.APIs;
-using System.Collections.Generic;
+﻿// MoreAfflictions_UIBootstrap.cs
+// Ensures each custom status has a proper BarAffliction UI instance bound to it.
+
+using System;
 using System.Linq;
 using System.Reflection;
+using BepInEx;
+using HarmonyLib;
 using UnityEngine;
-using UnityEngine.Events;               // ✅ needed for UnityAction<Scene, LoadSceneMode>
-using UnityEngine.SceneManagement;
-using UnityEngine.UI;
+using MoreAfflictionsPlugin.APIs;
 
-namespace MoreAfflictionsMod
+namespace MoreAfflictionsPlugin
 {
-    [BepInPlugin("com.khakixd.moreafflictions", "More Afflictions", "0.2.9")]
-    public class MoreAfflictionsPlugin : BaseUnityPlugin
+    [BepInPlugin("com.khakixd.moreafflictions", "More Afflictions", "0.4.0")]
+    public sealed class MoreAfflictionsPlugin : BaseUnityPlugin
     {
         private Harmony _harmony;
 
-        private ConfigEntry<bool> _demoEnable;
-        private ConfigEntry<string> _demoName;
-        private ConfigEntry<float> _demoCap;
-        private ConfigEntry<float> _demoStartAmount;
-        private ConfigEntry<bool> _demoAutoTick;
-        private ConfigEntry<float> _demoTickPerSecond;
-        private ConfigEntry<string> _demoHexColor;
-
-        private static readonly Dictionary<int, HashSet<string>> _barNamesPerStaminaBar =
-            new Dictionary<int, HashSet<string>>();
-
-        // ✅ Use the correct delegate type for SceneManager.sceneLoaded
-        private UnityAction<Scene, LoadSceneMode> _onSceneLoaded;
-
-        // Heal vanilla BarAffliction.rtf on clones (prevents NRE in get_width)
-        private static readonly FieldInfo F_BarAffliction_rtf =
-            AccessTools.Field(typeof(BarAffliction), "rtf");
-
         private void Awake()
         {
-            _demoEnable = Config.Bind("Testing.Demo", "Enable", true, "Enable a demo custom affliction for testing.");
-            _demoName = Config.Bind("Testing.Demo", "Name", "Demo_Affliction", "Name of the demo custom affliction.");
-            _demoCap = Config.Bind("Testing.Demo", "Cap", 1.0f, "Cap for the demo affliction.");
-            _demoStartAmount = Config.Bind("Testing.Demo", "StartAmount", 0.25f, "Initial amount to trigger UI.");
-            _demoAutoTick = Config.Bind("Testing.Demo", "AutoTick", true, "If true, increases value over time (local HUD).");
-            _demoTickPerSecond = Config.Bind("Testing.Demo", "TickPerSecond", 0.02f, "Increase per second.");
-            _demoHexColor = Config.Bind("Testing.Demo", "Color", "#34C3FF", "HTML color for demo bar (RGB or RGBA).");
-
-            if (_demoEnable.Value)
-                AfflictionsAPI.RegisterStatus(_demoName.Value, _demoCap.Value, null);
-
             _harmony = new Harmony("com.khakixd.moreafflictions");
             _harmony.PatchAll(Assembly.GetExecutingAssembly());
-
-            // Correct API event
-            AfflictionsAPI.StatusAdded += OnStatusAdded_FirstTimeSpawner;
-
-            // ✅ Correctly-typed handler assignment + subscription
-            _onSceneLoaded = (scene, mode) => { _barNamesPerStaminaBar.Clear(); };
-            SceneManager.sceneLoaded += _onSceneLoaded;
-
-            if (_demoEnable.Value)
-                StartCoroutine(DemoRoutine());
+            Logger.LogInfo("[MoreAfflictions] UIBootstrap loaded.");
         }
 
         private void OnDestroy()
         {
-            try { AfflictionsAPI.StatusAdded -= OnStatusAdded_FirstTimeSpawner; } catch { }
-            if (_onSceneLoaded != null) SceneManager.sceneLoaded -= _onSceneLoaded;
             try { _harmony?.UnpatchSelf(); } catch { }
         }
+    }
 
-        // === Spawn or reuse a custom bar the first time a status shows up on the local HUD ===
-        private void OnStatusAdded_FirstTimeSpawner(CharacterAfflictions ca, int index, float amount)
+    /// <summary>
+    /// Finds/creates BarAffliction clones for registered custom statuses.
+    /// We do NOT patch BarAffliction logic at all; we just supply a correct UI entry.
+    /// </summary>
+    [HarmonyPatch(typeof(StaminaBar))]
+    internal static class StaminaBar_CustomAfflictions
+    {
+        // reflection handles (field name is "type" in the vanilla BarAffliction)
+        private static readonly FieldInfo F_BarAffliction_Type =
+            AccessTools.Field(typeof(BarAffliction), "type"); // type: CharacterAfflictions.STATUSTYPE
+
+        // Some builds use "rtf" as the width driver; we don't set it here, the clone keeps it.
+        // We only ensure the item exists and is added to StaminaBar.afflictions.
+
+        // Run once when the StaminaBar gets its children cached
+        [HarmonyPostfix, HarmonyPatch("Start")]
+        private static void Start_Post(StaminaBar __instance)
         {
-            if (!Character.observedCharacter || Character.observedCharacter.refs == null) return;
-            if (!ReferenceEquals(ca, Character.observedCharacter.refs.afflictions)) return;
+            SafePrune(__instance);
+            EnsureCustomAfflictionsPresent(__instance);
+            RefreshCache(__instance);
+        }
 
-            var bar = Object.FindFirstObjectByType<StaminaBar>();
-            if (!bar) return;
+        // Make sure array stays clean + present even if scene swaps
+        [HarmonyPrefix, HarmonyPatch("ChangeBar")]
+        private static void ChangeBar_Pre(StaminaBar __instance)
+        {
+            SafePrune(__instance);
+            EnsureCustomAfflictionsPresent(__instance);
+            RefreshCache(__instance);
+        }
 
-            string statusName = AfflictionsAPI.GetNameForIndex(index) ?? ("CustomStatus_" + index);
+        [HarmonyPrefix, HarmonyPatch("Update")]
+        private static void Update_Pre(StaminaBar __instance)
+        {
+            SafePrune(__instance);
+        }
 
-            // Reuse if already spawned
-            var existing = FindAllCustomBars(bar, statusName);
-            if (existing.Count > 0)
+        private static void SafePrune(StaminaBar bar)
+        {
+            if (bar == null || bar.Equals(null)) return;
+            if (bar.afflictions == null) return;
+
+            var clean = bar.afflictions.Where(a => a && !a.Equals(null)).ToArray();
+            if (!ReferenceEquals(clean, bar.afflictions))
+                bar.afflictions = clean;
+        }
+
+        private static void RefreshCache(StaminaBar bar)
+        {
+            // Make sure StaminaBar.afflictions includes our clones
+            var now = bar.GetComponentsInChildren<BarAffliction>(true);
+            if (!ReferenceEquals(now, bar.afflictions))
+                bar.afflictions = now;
+        }
+
+        private static void EnsureCustomAfflictionsPresent(StaminaBar bar)
+        {
+            if (bar == null || bar.Equals(null)) return;
+
+            // Need a template
+            var template = PickTemplate(bar);
+            if (template == null) return;
+
+            // Iterate all known custom statuses
+            var customNames = AfflictionsAPI.GetRegisteredCustomNames();
+            if (customNames == null || customNames.Count == 0) return;
+
+            foreach (var name in customNames)
             {
-                for (int i = 1; i < existing.Count; i++)
+                int index;
+                if (!AfflictionsAPI.TryGetIndex(name, out index) || index < 0)
+                    continue;
+
+                // Already have a BarAffliction with that index?
+                if (HasEntryFor(bar, index)) continue;
+
+                // Create one
+                CreateClone(bar, template, name, index);
+            }
+        }
+
+        private static BarAffliction PickTemplate(StaminaBar bar)
+        {
+            // Grab any existing vanilla BarAffliction (e.g., the first one)
+            BarAffliction tpl = null;
+
+            if (bar.afflictions != null && bar.afflictions.Length > 0)
+            {
+                tpl = bar.afflictions.FirstOrDefault(a => a && !a.Equals(null));
+            }
+            if (tpl == null)
+            {
+                // Fallback: search hierarchy
+                tpl = bar.GetComponentInChildren<BarAffliction>(true);
+            }
+
+            return tpl;
+        }
+
+        private static bool HasEntryFor(StaminaBar bar, int statusIndex)
+        {
+            if (bar.afflictions == null) return false;
+
+            for (int i = 0; i < bar.afflictions.Length; i++)
+            {
+                var a = bar.afflictions[i];
+                if (!a || a.Equals(null)) continue;
+
+                try
                 {
-                    if (existing[i]) Object.Destroy(existing[i].gameObject);
+                    var val = (CharacterAfflictions.STATUSTYPE)F_BarAffliction_Type.GetValue(a);
+                    if ((int)val == statusIndex) return true;
                 }
-                Track(bar, statusName);
-                return;
+                catch { }
             }
-
-            // Build a new one from a vanilla template
-            var template = bar.GetComponentsInChildren<BarAffliction>(true).FirstOrDefault();
-            if (!template)
-            {
-                Logger.LogWarning("[MoreAfflictions] No BarAffliction template found under StaminaBar; cannot spawn custom bar.");
-                return;
-            }
-
-            var cloneGO = Instantiate(template.gameObject, template.transform.parent);
-            cloneGO.name = "AfflictionBar_" + statusName;
-            cloneGO.transform.SetSiblingIndex(template.transform.GetSiblingIndex());
-            cloneGO.SetActive(true);
-
-            // Our helper
-            var helper = cloneGO.AddComponent<BarAfflictionCustom>();
-            helper.statusName = statusName;
-            helper.rtf = cloneGO.GetComponent<RectTransform>();
-
-            // 🔧 Heal vanilla field so BarAffliction.get_width() won’t NRE
-            var clonedBA = cloneGO.GetComponent<BarAffliction>();
-            if (clonedBA && F_BarAffliction_rtf != null)
-            {
-                var rt = cloneGO.GetComponent<RectTransform>();
-                if (rt) F_BarAffliction_rtf.SetValue(clonedBA, rt);
-            }
-
-            // Tint (keep alpha)
-            var rgb = ChooseTintRGB(statusName);
-            foreach (var img in cloneGO.GetComponentsInChildren<Image>(true))
-            {
-                if (!img) continue;
-                var c0 = img.color;
-                img.color = new Color(rgb.r, rgb.g, rgb.b, c0.a);
-            }
-
-            // Refresh StaminaBar's cache
-            bar.afflictions = bar.GetComponentsInChildren<BarAffliction>(true);
-
-            // One-time icon (if provided)
-            helper.TryApplyIconOnce();
-
-            Track(bar, statusName);
-            Logger.LogInfo($"[UI] Spawned custom bar for '{statusName}' amount={amount}");
+            return false;
         }
 
-        private static void Track(StaminaBar bar, string statusName)
+        private static void CreateClone(StaminaBar bar, BarAffliction template, string statusName, int statusIndex)
         {
-            if (!bar || string.IsNullOrEmpty(statusName)) return;
-            int id = bar.GetInstanceID();
-            if (!_barNamesPerStaminaBar.TryGetValue(id, out var set))
+            try
             {
-                set = new HashSet<string>();
-                _barNamesPerStaminaBar[id] = set;
-            }
-            set.Add(statusName);
-        }
+                var parent = template.transform.parent;
+                var cloneGo = UnityEngine.Object.Instantiate(template.gameObject, parent, false);
+                cloneGo.name = "Affliction_Custom_" + statusName;
 
-        private static List<BarAfflictionCustom> FindAllCustomBars(StaminaBar bar, string statusName)
-        {
-            var list = new List<BarAfflictionCustom>(2);
-            if (!bar) return list;
-            var all = bar.GetComponentsInChildren<BarAfflictionCustom>(true);
-            foreach (var bac in all)
-            {
-                if (bac && string.Equals(bac.statusName, statusName, System.StringComparison.OrdinalIgnoreCase))
-                    list.Add(bac);
-            }
-            return list;
-        }
+                // Make it render after the template (to the right)
+                cloneGo.transform.SetSiblingIndex(template.transform.GetSiblingIndex() + 1);
 
-        private System.Collections.IEnumerator DemoRoutine()
-        {
-            while (!Character.observedCharacter) yield return null;
-
-            StaminaBar bar = null;
-            while ((bar = Object.FindFirstObjectByType<StaminaBar>()) == null)
-                yield return null;
-
-            var refs = Character.observedCharacter.refs;
-            var ca = refs != null ? refs.afflictions : null;
-            if (ca != null && !string.IsNullOrEmpty(_demoName.Value))
-            {
-                if (!ca.AddStatus(_demoName.Value, _demoStartAmount.Value))
-                    ca.SetStatus(_demoName.Value, _demoStartAmount.Value);
-            }
-
-            if (_demoAutoTick.Value && ca != null && _demoTickPerSecond.Value > 0f)
-            {
-                for (; ; )
+                // Bind the new status index
+                var clone = cloneGo.GetComponent<BarAffliction>();
+                if (clone != null && F_BarAffliction_Type != null)
                 {
-                    if (Character.observedCharacter &&
-                        ReferenceEquals(ca, Character.observedCharacter.refs.afflictions))
-                    {
-                        ca.AddStatus(_demoName.Value, _demoTickPerSecond.Value * Time.deltaTime);
-                    }
-                    yield return null;
+                    F_BarAffliction_Type.SetValue(clone, (CharacterAfflictions.STATUSTYPE)statusIndex);
                 }
-            }
-        }
 
-        private Color ChooseTintRGB(string statusName)
-        {
-            if (!string.IsNullOrEmpty(_demoName.Value) &&
-                string.Equals(statusName, _demoName.Value, System.StringComparison.OrdinalIgnoreCase) &&
-                ColorUtility.TryParseHtmlString(_demoHexColor.Value, out var parsed))
-            {
-                return new Color(parsed.r, parsed.g, parsed.b, 1f);
+                // Start disabled; vanilla will enable it based on current value in ChangeAffliction
+                cloneGo.SetActive(false);
             }
-
-            unchecked
+            catch (Exception ex)
             {
-                int hash = statusName.GetHashCode();
-                float hue = ((hash & 0xFFFFFF) / (float)0xFFFFFF);
-                Color hsvCol = Color.HSVToRGB(hue, 0.65f, 0.95f);
-                hsvCol.a = 1f;
-                return hsvCol;
+                Debug.LogError("[MoreAfflictions] Failed to create UI clone for '" + statusName + "': " + ex);
             }
         }
     }
