@@ -18,7 +18,7 @@ namespace MoreAfflictionsPlugin.APIs
     /// - Name-based extension helpers (Get/Set/Add/Subtract)
     /// - Harmony patches expand arrays and respect custom caps
     /// </summary>
-    internal static class AfflictionsAPI
+    public static class AfflictionsAPI
     {
         // Fired when a (custom) status first becomes > 0 on a character
         public static event Action<CharacterAfflictions, int, float> OnStatusCreated;
