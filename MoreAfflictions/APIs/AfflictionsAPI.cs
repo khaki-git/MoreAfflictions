@@ -93,6 +93,16 @@ namespace MoreAfflictionsPlugin.APIs
             }
         }
 
+        public static void SetStatusIcon(string name, Sprite icon)
+        {
+            if (string.IsNullOrEmpty(name)) return;
+            lock (_lockObj)
+            {
+                _nameToIcon[name] = icon;
+            }
+        }
+
+
         /// <summary>Overload without icon (kept for older mods using the 3-arg pattern).</summary>
         public static int RegisterStatus(string name, float cap, Action<CharacterAfflictions, float> onAdded)
         {
@@ -298,11 +308,11 @@ namespace MoreAfflictionsPlugin.APIs
         // Optional: call the OnAdded callback after successful AddStatus for customs.
         [HarmonyPostfix]
         [HarmonyPatch(typeof(CharacterAfflictions), nameof(CharacterAfflictions.AddStatus))]
-        private static void AddStatus_Postfix(CharacterAfflictions __instance, CharacterAfflictions.STATUSTYPE type, float amount, bool incremental)
+        private static void AddStatus_Postfix(CharacterAfflictions __instance, CharacterAfflictions.STATUSTYPE statusType, float amount, bool fromRPC)
         {
             try
             {
-                AfflictionsAPI.InvokeOnAdded(__instance, (int)type, amount);
+                AfflictionsAPI.InvokeOnAdded(__instance, (int)statusType, amount);
             }
             catch (Exception ex)
             {
