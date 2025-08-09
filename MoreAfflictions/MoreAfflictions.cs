@@ -266,11 +266,14 @@ namespace MoreAfflictionsPlugin
         /// <summary>
         /// Loops through the given transform and all its descendants, setting any Image's colour.
         /// </summary>
-        private static void ApplyColorToHierarchy(Transform root, Color color)
+        private static void ApplyColorToHierarchy(Transform root, Color rgbColor)
         {
             foreach (var img in root.GetComponentsInChildren<UnityEngine.UI.Image>(true))
             {
-                img.color = color;
+                if (img == null) continue;
+                float originalAlpha = img.color.a; // preserve transparency
+                Color newColor = new Color(rgbColor.r, rgbColor.g, rgbColor.b, originalAlpha);
+                img.color = newColor;
             }
         }
 
