@@ -1,55 +1,41 @@
 ﻿// MoreAfflictions\APIs\AfflictionsAPI.cs
+// C# 7.3 compatible
+
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Reflection;
-using System.Text;
 using HarmonyLib;
 using UnityEngine;
 
 namespace MoreAfflictionsPlugin.APIs
 {
     /// <summary>
-    /// Generic modding API for custom afflictions.
-    /// - Deterministic, multiplayer-safe registry (alphabetical finalisation -> stable indices).
-    /// - RegisterStatus(name, cap, onAdded)
-    /// - Global OnStatusCreated (fires when a status first becomes > 0 on a character)
-    /// - Optional UI factory per status
-    /// - Name-based extension helpers (Get/Set/Add/Subtract)
-    /// - Harmony patches expand arrays and respect custom caps
+    /// Minimal custom-affliction API:
+    ///  - Register custom statuses by name (each gets a virtual index after the vanilla enum).
+    ///  - Optional per-status cap and "on added" callback.
+    ///  - Optional per-status ICON (Sprite).
+    ///  - Name-based extension helpers (Get/Set/Add/Subtract).
+    ///  
+    /// Internals:
+    ///  - Patches CharacterAfflictions to expand arrays and honour caps.
+    ///  - Postfixes AddStatus(...) to invoke custom callbacks and raise a StatusAdded event.
     /// </summary>
     public static class AfflictionsAPI
     {
-        // Fired when a (custom) status first becomes > 0 on a character
-        public static event Action<CharacterAfflictions, int, float> OnStatusCreated;
-
-        // Optional: per-status UI factory (index -> factory)
-        public delegate void StatusUIFactory(CharacterAfflictions ca, int index, float amount);
-        private static readonly Dictionary<int, StatusUIFactory> _uiFactoriesByIndex = new Dictionary<int, StatusUIFactory>();
-        public static void RegisterUIFactory(string name, StatusUIFactory factory)
-        {
-            if (factory == null) throw new ArgumentNullException("factory");
-            int idx;
-            if (!TryGetIndex(name, out idx)) throw new ArgumentException("Unknown status: " + name);
-            lock (_lockObj) _uiFactoriesByIndex[idx] = factory;
-        }
-
-        // ===== Registry (finalised alphabetically; MP safe) =====
         private static readonly object _lockObj = new object();
 
-        private class CustomStatus
-        {
-            public string Name;
-            public float Cap;
-            public Action<CharacterAfflictions, float> OnAdded;
-        }
+        // Registered custom statuses (order is the virtual index offset from BaseCount)
+        private static readonly List<CustomStatus> _customs = new List<CustomStatus>();
 
-        private static readonly List<CustomStatus> _pending = new List<CustomStatus>();
-        private static Dictionary<string, int> _nameToIndexFinal;
-        private static List<CustomStatus> _finalOrder;
-        private static bool _finalised;
-        private static string _signature;
+        // Name -> virtual index
+        private static readonly Dictionary<string, int> _nameToIndex =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
+        // Optional icon per status name
+        private static readonly Dictionary<string, Sprite> _nameToIcon =
+            new Dictionary<string, Sprite>(StringComparer.OrdinalIgnoreCase);
+
+        // Cache the base enum length (vanilla statuses)
         private static int _baseCount = -1;
         private static int BaseCount
         {
@@ -63,52 +49,70 @@ namespace MoreAfflictionsPlugin.APIs
 
         internal static int TotalCount
         {
-            get
-            {
-                EnsureFinalised();
-                lock (_lockObj) return BaseCount + (_finalOrder != null ? _finalOrder.Count : 0);
-            }
+            get { lock (_lockObj) return BaseCount + _customs.Count; }
         }
 
+        /// <summary>
+        /// Raised after CharacterAfflictions.AddStatus(...) finishes for ANY status (vanilla or custom).
+        /// Signature: (CharacterAfflictions instance, status index, amount).
+        /// </summary>
+        public static event Action<CharacterAfflictions, int, float> StatusAdded;
+
+        /// <summary>
+        /// Register a custom status. If the name already exists, returns its index.
+        /// cap applies only to the custom cap in GetStatusCap(). onAdded is invoked when that status gets added.
+        /// </summary>
         public static int RegisterStatus(string name, float cap, Action<CharacterAfflictions, float> onAdded)
         {
             if (string.IsNullOrEmpty(name)) throw new ArgumentException("name");
+
             lock (_lockObj)
             {
-                if (_finalised)
-                {
-                    Debug.LogWarning("[MoreAfflictions] RegisterStatus after finalise; ignoring: " + name);
-                    int idxExisting;
-                    return TryGetIndex(name, out idxExisting) ? idxExisting : -1;
-                }
+                int idx;
+                if (_nameToIndex.TryGetValue(name, out idx))
+                    return idx;
 
-                // de-dupe (case-insensitive)
-                for (int i = 0; i < _pending.Count; i++)
-                    if (string.Equals(_pending[i].Name, name, StringComparison.OrdinalIgnoreCase))
-                        return -1;
-
-                _pending.Add(new CustomStatus
+                idx = BaseCount + _customs.Count;
+                _customs.Add(new CustomStatus
                 {
                     Name = name,
+                    Index = idx,
                     Cap = Mathf.Max(0f, cap),
                     OnAdded = onAdded
                 });
-
-                // index unknown until finalisation
-                return -1;
+                _nameToIndex[name] = idx;
+                return idx;
             }
         }
 
-        public static bool TryGetIndex(string name, out int index)
+        /// <summary>Assign or replace an icon Sprite for a registered (or soon-to-be registered) status name.</summary>
+        public static void SetStatusIcon(string name, Sprite sprite)
         {
-            EnsureFinalised();
+            if (string.IsNullOrEmpty(name)) return;
+            lock (_lockObj) _nameToIcon[name] = sprite;
+        }
+
+        /// <summary>Internal: get an icon for a given status NAME (returns null if none set).</summary>
+        internal static Sprite GetStatusIcon(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return null;
             lock (_lockObj)
             {
-                if (_nameToIndexFinal != null && _nameToIndexFinal.TryGetValue(name, out index))
+                Sprite s;
+                return _nameToIcon.TryGetValue(name, out s) ? s : null;
+            }
+        }
+
+        /// <summary>Try to resolve a status NAME to an index (handles both vanilla enum names and custom names).</summary>
+        public static bool TryGetIndex(string name, out int index)
+        {
+            lock (_lockObj)
+            {
+                if (_nameToIndex.TryGetValue(name, out index))
                     return true;
             }
 
-            // fall back to vanilla enum
+            // Try vanilla enum names (case-insensitive)
             string[] names = Enum.GetNames(typeof(CharacterAfflictions.STATUSTYPE));
             for (int i = 0; i < names.Length; i++)
             {
@@ -122,144 +126,98 @@ namespace MoreAfflictionsPlugin.APIs
             return false;
         }
 
+        /// <summary>Resolve index → name (vanilla or custom). Returns null if unknown.</summary>
         public static string GetNameForIndex(int index)
         {
-            EnsureFinalised();
             if (index < 0) return null;
-
             if (index < BaseCount)
             {
-                var names = Enum.GetNames(typeof(CharacterAfflictions.STATUSTYPE));
-                return index < names.Length ? names[index] : null;
+                try { return Enum.GetName(typeof(CharacterAfflictions.STATUSTYPE), index); }
+                catch { return null; }
             }
 
-            int off = index - BaseCount;
-            lock (_lockObj)
-            {
-                if (_finalOrder != null && off >= 0 && off < _finalOrder.Count)
-                    return _finalOrder[off].Name;
-            }
-            return null;
+            CustomStatus cs = GetCustomByIndex(index);
+            return cs != null ? cs.Name : null;
         }
+
+        // --------- Internal helpers used by patches/UI ---------
 
         internal static float GetCapOr(float fallback, int index)
         {
-            EnsureFinalised();
             if (index < BaseCount) return fallback;
-            int off = index - BaseCount;
-            lock (_lockObj)
-            {
-                if (_finalOrder != null && off >= 0 && off < _finalOrder.Count)
-                    return _finalOrder[off].Cap;
-            }
-            return fallback;
+            CustomStatus cs = GetCustomByIndex(index);
+            return cs != null ? cs.Cap : fallback;
         }
 
         internal static void InvokeOnAdded(CharacterAfflictions ca, int index, float amount)
         {
-            EnsureFinalised();
-            int off = index - BaseCount;
-            if (off < 0) return;
-            CustomStatus cs = null;
+            try
+            {
+                CustomStatus cs = GetCustomByIndex(index);
+                if (cs != null && cs.OnAdded != null)
+                    cs.OnAdded(ca, amount);
+            }
+            catch (Exception ex) { Debug.LogError("MoreAfflictions OnAdded callback error: " + ex); }
+
+            // Public event for anyone (UI spawner etc.)
+            try
+            {
+                if (StatusAdded != null)
+                    StatusAdded(ca, index, amount);
+            }
+            catch (Exception ex) { Debug.LogError("MoreAfflictions StatusAdded event error: " + ex); }
+        }
+
+        private static CustomStatus GetCustomByIndex(int index)
+        {
+            int offset = index - BaseCount;
+            if (offset < 0) return null;
             lock (_lockObj)
             {
-                if (_finalOrder != null && off >= 0 && off < _finalOrder.Count)
-                    cs = _finalOrder[off];
-            }
-            if (cs != null && cs.OnAdded != null)
-            {
-                try { cs.OnAdded(ca, amount); }
-                catch (Exception ex) { Debug.LogError("MoreAfflictions OnAdded error: " + ex); }
+                return (offset >= 0 && offset < _customs.Count) ? _customs[offset] : null;
             }
         }
 
-        internal static void RaiseStatusCreated(CharacterAfflictions ca, int index, float amount)
+        private class CustomStatus
         {
-            EnsureFinalised();
-            if (index >= BaseCount)
-            {
-                try
-                {
-                    InvokeOnAdded(ca, index, amount);
-
-                    StatusUIFactory factory;
-                    lock (_lockObj)
-                    {
-                        if (_uiFactoriesByIndex.TryGetValue(index, out factory) && factory != null)
-                            factory(ca, index, amount);
-                    }
-
-                    var evt = OnStatusCreated;
-                    if (evt != null) evt(ca, index, amount);
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogError("MoreAfflictions RaiseStatusCreated error: " + ex);
-                }
-            }
+            public string Name;
+            public int Index;
+            public float Cap;
+            public Action<CharacterAfflictions, float> OnAdded;
         }
 
-        internal static void EnsureFinalised()
-        {
-            if (_finalised) return;
-            lock (_lockObj)
-            {
-                if (_finalised) return;
-
-                var ordered = _pending
-                    .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-
-                _finalOrder = ordered;
-                _nameToIndexFinal = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-
-                for (int i = 0; i < ordered.Count; i++)
-                    _nameToIndexFinal[ordered[i].Name] = BaseCount + i;
-
-                var sb = new StringBuilder();
-                sb.Append(BaseCount).Append("|");
-                for (int i = 0; i < ordered.Count; i++)
-                {
-                    if (i > 0) sb.Append(",");
-                    sb.Append(ordered[i].Name);
-                }
-                _signature = sb.ToString();
-                _finalised = true;
-
-                Debug.Log("[MoreAfflictions] Registry finalised. BaseCount=" + BaseCount +
-                          ", CustomCount=" + ordered.Count +
-                          ", Signature=" + _signature);
-            }
-        }
-
-        // ---------- Extensions ----------
+        // ---------- Extension helpers (name-based) ----------
         public static float GetStatus(this CharacterAfflictions ca, string name)
         {
-            int idx; return TryGetIndex(name, out idx)
+            int idx;
+            return TryGetIndex(name, out idx)
                 ? ca.GetCurrentStatus((CharacterAfflictions.STATUSTYPE)idx)
                 : 0f;
         }
 
         public static void SetStatus(this CharacterAfflictions ca, string name, float value)
         {
-            int idx; if (TryGetIndex(name, out idx))
+            int idx;
+            if (TryGetIndex(name, out idx))
                 ca.SetStatus((CharacterAfflictions.STATUSTYPE)idx, value);
         }
 
         public static bool AddStatus(this CharacterAfflictions ca, string name, float amount)
         {
-            int idx; return TryGetIndex(name, out idx) &&
-                ca.AddStatus((CharacterAfflictions.STATUSTYPE)idx, amount, false);
+            int idx;
+            return TryGetIndex(name, out idx) &&
+                   ca.AddStatus((CharacterAfflictions.STATUSTYPE)idx, amount, false);
         }
 
         public static void SubtractStatus(this CharacterAfflictions ca, string name, float amount)
         {
-            int idx; if (TryGetIndex(name, out idx))
+            int idx;
+            if (TryGetIndex(name, out idx))
                 ca.SubtractStatus((CharacterAfflictions.STATUSTYPE)idx, amount, false);
         }
     }
 
-    // ===================== Harmony Patches =====================
+    // --------- Harmony patches ----------
     [HarmonyPatch]
     internal static class CharacterAfflictionsPatches
     {
@@ -274,16 +232,7 @@ namespace MoreAfflictionsPlugin.APIs
         private static readonly FieldInfo F_LastInc =
             AccessTools.Field(typeof(CharacterAfflictions), "lastAddedIncrementalStatus");
 
-        // Ensure registry is finalised BEFORE vanilla arrays are built
-        [HarmonyPrefix]
-        [HarmonyPatch(typeof(CharacterAfflictions), "InitStatusArrays")]
-        private static void InitStatusArrays_Prefix()
-        {
-            try { AfflictionsAPI.EnsureFinalised(); }
-            catch (Exception ex) { Debug.LogError("MoreAfflictions EnsureFinalised prefix: " + ex); }
-        }
-
-        // Expand arrays to include custom statuses
+        // Expand arrays to fit customs
         [HarmonyPostfix]
         [HarmonyPatch(typeof(CharacterAfflictions), "InitStatusArrays")]
         private static void InitStatusArrays_Postfix(CharacterAfflictions __instance)
@@ -291,6 +240,7 @@ namespace MoreAfflictionsPlugin.APIs
             try
             {
                 int total = AfflictionsAPI.TotalCount;
+
                 float[] cur = (float[])F_Current.GetValue(__instance);
                 if (cur == null || cur.Length >= total) return;
 
@@ -314,7 +264,7 @@ namespace MoreAfflictionsPlugin.APIs
             catch (Exception ex) { Debug.LogError("MoreAfflictions InitStatusArrays postfix: " + ex); }
         }
 
-        // Respect custom caps
+        // Apply custom caps
         [HarmonyPostfix]
         [HarmonyPatch(typeof(CharacterAfflictions), nameof(CharacterAfflictions.GetStatusCap))]
         private static void GetStatusCap_Postfix(ref float __result, CharacterAfflictions.STATUSTYPE type)
@@ -323,56 +273,22 @@ namespace MoreAfflictionsPlugin.APIs
             catch (Exception ex) { Debug.LogError("MoreAfflictions GetStatusCap postfix: " + ex); }
         }
 
-        // Detect 0 -> >0 in AddStatus
-        [HarmonyPatch(typeof(CharacterAfflictions), nameof(CharacterAfflictions.AddStatus))]
-        private static class AddStatus_Patch
-        {
-            static void Prefix(CharacterAfflictions __instance,
-                               [HarmonyArgument(0)] CharacterAfflictions.STATUSTYPE statusType,
-                               out float __state)
-                => __state = GetCurrent(__instance, (int)statusType);
-
-            static void Postfix(CharacterAfflictions __instance,
-                                [HarmonyArgument(0)] CharacterAfflictions.STATUSTYPE statusType,
-                                bool __result,
-                                float __state)
-            {
-                if (!__result) return;
-                int idx = (int)statusType;
-                float now = GetCurrent(__instance, idx);
-                if (__state <= 0f && now > 0f)
-                    AfflictionsAPI.RaiseStatusCreated(__instance, idx, now);
-            }
-        }
-
-        // Detect 0 -> >0 in SetStatus
-        [HarmonyPatch(typeof(CharacterAfflictions), nameof(CharacterAfflictions.SetStatus))]
-        private static class SetStatus_Patch
-        {
-            static void Prefix(CharacterAfflictions __instance,
-                               [HarmonyArgument(0)] CharacterAfflictions.STATUSTYPE statusType,
-                               out float __state)
-                => __state = GetCurrent(__instance, (int)statusType);
-
-            static void Postfix(CharacterAfflictions __instance,
-                                [HarmonyArgument(0)] CharacterAfflictions.STATUSTYPE statusType,
-                                float __state)
-            {
-                int idx = (int)statusType;
-                float now = GetCurrent(__instance, idx);
-                if (__state <= 0f && now > 0f)
-                    AfflictionsAPI.RaiseStatusCreated(__instance, idx, now);
-            }
-        }
-
-        private static float GetCurrent(CharacterAfflictions ca, int idx)
+        // Notify when a status is added (drives OnAdded + StatusAdded event)
+        // Signature must match the game's: AddStatus(STATUSTYPE statusType, float amount, bool fromRPC)
+        [HarmonyPostfix]
+        [HarmonyPatch(typeof(CharacterAfflictions), nameof(CharacterAfflictions.AddStatus),
+            new Type[] { typeof(CharacterAfflictions.STATUSTYPE), typeof(float), typeof(bool) })]
+        private static void AddStatus_Postfix(CharacterAfflictions __instance,
+                                              CharacterAfflictions.STATUSTYPE statusType,
+                                              float amount,
+                                              bool fromRPC)
         {
             try
             {
-                var cur = (float[])F_Current.GetValue(ca);
-                return (cur != null && idx >= 0 && idx < cur.Length) ? cur[idx] : 0f;
+                if (amount > 0f)
+                    AfflictionsAPI.InvokeOnAdded(__instance, (int)statusType, amount);
             }
-            catch { return 0f; }
+            catch (Exception ex) { Debug.LogError("MoreAfflictions AddStatus postfix: " + ex); }
         }
     }
 }
